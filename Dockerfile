@@ -1,15 +1,18 @@
-# ── pull in the official Slack MCP server (with all code & deps in /app) ─────
+# ── Stage 1: grab the official Slack MCP server (it has /app/dist + node_modules) ──
 FROM mcp/slack AS slack
 
-# ── pull in the MCP-Proxy bridge ────────────────────────────────────────────
+# ── Stage 2: start from the MCP‐Proxy image (Python) ──────────────────────────────
 FROM ghcr.io/sparfenyuk/mcp-proxy:latest
 
-# copy the entire Slack server app (/app contains dist/, node_modules/, etc)
+# Install Node + npm so "node" is available for the Slack server
+RUN apk update && apk add --no-cache nodejs npm
+
+# Copy the entire Slack app (dist/, node_modules/, etc.) into this image
 COPY --from=slack /app /app
 WORKDIR /app
 
-# expose SSE port
+# Expose the same SSE port
 EXPOSE 3001
 
-# one-line ENTRYPOINT: run the proxy (SSE→stdio) and spawn Slack via node
+# Launch the proxy (SSE→stdio) and then "node dist/index.js"
 ENTRYPOINT ["mcp-proxy","--pass-environment","--sse-port","3001","--sse-host","0.0.0.0","--","node","dist/index.js"]
