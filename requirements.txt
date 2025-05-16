@@ -1,0 +1,6 @@
+fastmcp
+fastapi
+uvicorn
+httpx
+python-dotenv
+asyncpg
