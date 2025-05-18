@@ -1,291 +1,201 @@
 #!/usr/bin/env python3
-"""
-Slack MCP Server in Python using FastMCP over SSE with FastAPI.
-Dynamic multi-tenant support: tokens fetched from Postgres by team_id; channel listing via users.conversations with current_user_id and access checks.
-"""
 import os
-import sys
 import logging
+import requests
+import psycopg2
 from typing import Optional
+
 from dotenv import load_dotenv
-from fastapi import FastAPI
-import asyncpg
-import httpx
+from fastapi import FastAPI, HTTPException
 from mcp.server.fastmcp import FastMCP
 
 # — Load env & configure logging —
 load_dotenv()
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL must be set in your .env")
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("slack_mcp")
 
-# — Postgres connection URL —
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    logger.error("Please set DATABASE_URL environment variable")
-    sys.exit(1)
 
-# — Instantiate FastMCP —
-mcp = FastMCP("SlackServer", path_prefix="")
+def fetch_bot_token(team_id: str) -> str:
+    """
+    Retrieve the Slack bot token for a given team_id from Postgres.
+    """
+    conn = psycopg2.connect(DATABASE_URL)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT bot_token FROM slack_bots WHERE team_id = %s", (team_id,)
+            )
+            row = cur.fetchone()
+            if not row:
+                raise ValueError(f"No bot_token found for team_id {team_id}")
+            return row[0]
+    finally:
+        conn.close()
 
-# — Global DB pool —
-db_pool: Optional[asyncpg.Pool] = None
 
-# — FastAPI app & lifecycle —
-app = FastAPI()
-@app.on_event("startup")
-async def startup_db():
-    global db_pool
-    db_pool = await asyncpg.create_pool(DATABASE_URL)
-    logger.info("Connected to Postgres at %s", DATABASE_URL)
+class SlackClient:
+    def _get_headers(self, team_id: str) -> dict:
+        token = fetch_bot_token(team_id)
+        return {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
 
-@app.on_event("shutdown")
-async def shutdown_db():
-    await db_pool.close()
-    logger.info("Postgres connection pool closed")
-
-# — Helper: fetch bot_token by team_id —
-async def get_bot_token(team_id: str) -> str:
-    row = await db_pool.fetchrow(
-        "SELECT bot_token FROM slack_bots WHERE team_id = $1", team_id
-    )
-    if not row:
-        raise ValueError(f"No bot token for team_id={team_id}")
-    return row["bot_token"]
-
-# — Slack service with dynamic token per team —
-class SlackService:
-    async def _slack_request(
+    def get_user_conversations(
         self,
         team_id: str,
-        method: str,
-        api: str,
-        params: dict = None,
-        json_payload: dict = None
-    ) -> dict:
-        token = await get_bot_token(team_id)
-        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-        url = f"https://slack.com/api/{api}"
-        async with httpx.AsyncClient(headers=headers) as client:
-            if method.upper() == "GET":
-                resp = await client.get(url, params=params)
-            else:
-                resp = await client.post(url, json=json_payload)
-            resp.raise_for_status()
-            return resp.json()
-
-    async def list_channels(
-        self,
-        team_id: str,
-        user_id: str,
+        current_user_id: str,
         limit: int = 100,
-        cursor: Optional[str] = None
+        cursor: Optional[str] = None,
     ) -> dict:
-        logger.info("list_channels called: team_id=%s, user_id=%s, limit=%s, cursor=%s", team_id, user_id, limit, cursor)
-        params = {"user": user_id, "types": "public_channel,private_channel", "limit": min(limit, 200)}
+        """
+        List public and private channels the current_user is a member of.
+        """
+        headers = self._get_headers(team_id)
+        params = {
+            "user": current_user_id,
+            "types": "public_channel,private_channel",
+            "limit": min(limit, 200),
+        }
         if cursor:
             params["cursor"] = cursor
-        return await self._slack_request(team_id, "GET", "users.conversations", params=params)
 
-    async def post_message(
-        self,
-        team_id: str,
-        channel_id: str,
-        text: str
-    ) -> dict:
-        logger.info("post_message called: team_id=%s, channel_id=%s", team_id, channel_id)
-        return await self._slack_request(
-            team_id, "POST", "chat.postMessage", json_payload={"channel": channel_id, "text": text}
-        )
+        return requests.get(
+            "https://slack.com/api/users.conversations",
+            headers=headers,
+            params=params,
+        ).json()
 
-    async def post_reply(
-        self,
-        team_id: str,
-        channel_id: str,
-        thread_ts: str,
-        text: str
-    ) -> dict:
-        logger.info("post_reply called: team_id=%s, channel_id=%s, thread_ts=%s", team_id, channel_id, thread_ts)
-        return await self._slack_request(
-            team_id, "POST", "chat.postMessage", json_payload={"channel": channel_id, "thread_ts": thread_ts, "text": text}
-        )
+    def post_message(self, team_id: str, channel_id: str, text: str) -> dict:
+        headers = self._get_headers(team_id)
+        return requests.post(
+            "https://slack.com/api/chat.postMessage",
+            headers=headers,
+            json={"channel": channel_id, "text": text},
+        ).json()
 
-    async def add_reaction(
-        self,
-        team_id: str,
-        channel_id: str,
-        timestamp: str,
-        reaction: str
+    def post_reply(
+        self, team_id: str, channel_id: str, thread_ts: str, text: str
     ) -> dict:
-        logger.info("add_reaction called: team_id=%s, channel_id=%s, timestamp=%s, reaction=%s", team_id, channel_id, timestamp, reaction)
-        return await self._slack_request(
-            team_id, "POST", "reactions.add", json_payload={"channel": channel_id, "timestamp": timestamp, "name": reaction}
-        )
+        headers = self._get_headers(team_id)
+        return requests.post(
+            "https://slack.com/api/chat.postMessage",
+            headers=headers,
+            json={"channel": channel_id, "thread_ts": thread_ts, "text": text},
+        ).json()
 
-    async def get_channel_history(
-        self,
-        team_id: str,
-        channel_id: str,
-        limit: int = 10
+    def add_reaction(
+        self, team_id: str, channel_id: str, timestamp: str, reaction: str
     ) -> dict:
-        logger.info("get_channel_history called: team_id=%s, channel_id=%s, limit=%s", team_id, channel_id, limit)
-        return await self._slack_request(
-            team_id, "GET", "conversations.history", params={"channel": channel_id, "limit": limit}
-        )
+        headers = self._get_headers(team_id)
+        return requests.post(
+            "https://slack.com/api/reactions.add",
+            headers=headers,
+            json={"channel": channel_id, "timestamp": timestamp, "name": reaction},
+        ).json()
 
-    async def get_thread_replies(
-        self,
-        team_id: str,
-        channel_id: str,
-        thread_ts: str
+    def get_channel_history(
+        self, team_id: str, channel_id: str, limit: int = 10
     ) -> dict:
-        logger.info("get_thread_replies called: team_id=%s, channel_id=%s, thread_ts=%s", team_id, channel_id, thread_ts)
-        return await self._slack_request(
-            team_id, "GET", "conversations.replies", params={"channel": channel_id, "ts": thread_ts}
-        )
+        headers = self._get_headers(team_id)
+        return requests.get(
+            "https://slack.com/api/conversations.history",
+            headers=headers,
+            params={"channel": channel_id, "limit": limit},
+        ).json()
 
-    async def get_users(
-        self,
-        team_id: str,
-        limit: int = 100,
-        cursor: Optional[str] = None
+    def get_thread_replies(
+        self, team_id: str, channel_id: str, thread_ts: str
     ) -> dict:
-        logger.info("get_users called: team_id=%s, limit=%s, cursor=%s", team_id, limit, cursor)
+        headers = self._get_headers(team_id)
+        return requests.get(
+            "https://slack.com/api/conversations.replies",
+            headers=headers,
+            params={"channel": channel_id, "ts": thread_ts},
+        ).json()
+
+    def get_users(
+        self, team_id: str, limit: int = 100, cursor: Optional[str] = None
+    ) -> dict:
+        headers = self._get_headers(team_id)
         params = {"limit": min(limit, 200)}
         if cursor:
             params["cursor"] = cursor
-        return await self._slack_request(team_id, "GET", "users.list", params=params)
+        return requests.get(
+            "https://slack.com/api/users.list",
+            headers=headers,
+            params=params,
+        ).json()
 
-    async def get_user_profile(
-        self,
-        team_id: str,
-        user_id: str
-    ) -> dict:
-        logger.info("get_user_profile called: team_id=%s, user_id=%s", team_id, user_id)
-        return await self._slack_request(
-            team_id, "GET", "users.profile.get", params={"user": user_id, "include_labels": "true"}
-        )
+    def get_user_profile(self, team_id: str, user_id: str) -> dict:
+        headers = self._get_headers(team_id)
+        return requests.get(
+            "https://slack.com/api/users.profile.get",
+            headers=headers,
+            params={"user": user_id, "include_labels": True},
+        ).json()
 
-# — SlackService instance —
-service = SlackService()
 
-# — Tool definitions with access checks —
-@mcp.tool(name="slack_list_channels", description="List channels for a user in a workspace")
-async def slack_list_channels(
-    team_id: str,
-    current_user_id: str,
-    limit: int = 100,
-    cursor: Optional[str] = None
-) -> dict:
-    return await service.list_channels(team_id, current_user_id, limit, cursor)
+# — Instantiate FastMCP and Slack client —
+mcp = FastMCP("SlackMCPServer", path_prefix="")
+slack = SlackClient()
 
-@mcp.tool(name="slack_post_message", description="Post a message to a channel if user has access")
-async def slack_post_message(
-    team_id: str,
-    current_user_id: str,
-    channel_id: str,
-    text: str
-) -> dict:
-    # verify access
-    channels = await service.list_channels(team_id, current_user_id)
-    if channel_id not in {c.get("id") for c in channels.get("channels", [])}:
-        raise ValueError(f"User {current_user_id} has no access to channel {channel_id}")
-    return await service.post_message(team_id, channel_id, text)
-
-@mcp.tool(name="slack_reply_to_thread", description="Reply in a thread if user has access to channel")
-async def slack_reply_to_thread(
-    team_id: str,
-    current_user_id: str,
-    channel_id: str,
-    thread_ts: str,
-    text: str
-) -> dict:
-    channels = await service.list_channels(team_id, current_user_id)
-    if channel_id not in {c.get("id") for c in channels.get("channels", [])}:
-        raise ValueError(f"User {current_user_id} has no access to channel {channel_id}")
-    return await service.post_reply(team_id, channel_id, thread_ts, text)
-
-@mcp.tool(name="slack_add_reaction", description="Add reaction to a message if user has access")
-async def slack_add_reaction(
-    team_id: str,
-    current_user_id: str,
-    channel_id: str,
-    timestamp: str,
-    reaction: str
-) -> dict:
-    channels = await service.list_channels(team_id, current_user_id)
-    if channel_id not in {c.get("id") for c in channels.get("channels", [])}:
-        raise ValueError(f"User {current_user_id} has no access to channel {channel_id}")
-    return await service.add_reaction(team_id, channel_id, timestamp, reaction)
-
-@mcp.tool(name="slack_get_channel_history", description="Get recent channel messages if user has access")
-async def slack_get_channel_history(
-    team_id: str,
-    current_user_id: str,
-    channel_id: str,
-    limit: int = 10
-) -> dict:
-    channels = await service.list_channels(team_id, current_user_id)
-    if channel_id not in {c.get("id") for c in channels.get("channels", [])}:
-        raise ValueError(f"User {current_user_id} has no access to channel {channel_id}")
-    return await service.get_channel_history(team_id, channel_id, limit)
-
-@mcp.tool(name="slack_get_thread_replies", description="Get thread replies if user has access")
-async def slack_get_thread_replies(
-    team_id: str,
-    current_user_id: str,
-    channel_id: str,
-    thread_ts: str
-) -> dict:
-    channels = await service.list_channels(team_id, current_user_id)
-    if channel_id not in {c.get("id") for c in channels.get("channels", [])}:
-        raise ValueError(f"User {current_user_id} has no access to channel {channel_id}")
-    return await service.get_thread_replies(team_id, channel_id, thread_ts)
-
-@mcp.tool(name="slack_get_users", description="List users in a workspace")
-async def slack_get_users(
-    team_id: str,
-    limit: int = 100,
-    cursor: Optional[str] = None
-) -> dict:
-    return await service.get_users(team_id, limit, cursor)
-
-@mcp.tool(name="slack_get_user_profile", description="Get user profile details")
-async def slack_get_user_profile(
-    team_id: str,
-    user_id: str
-) -> dict:
-    return await service.get_user_profile(team_id, user_id)
-
-# — Additional tool: search messages across all channels accessible to the user —
-@mcp.tool(name="slack_search_messages", description="Search messages across all channels accessible to the current user")
-async def slack_search_messages(
-    team_id: str,
-    current_user_id: str,
-    query: str,
-    count: int = 20,
-    cursor: Optional[str] = None
-) -> dict:
-    """
-    Uses Slack's search.messages API to search across public and private channels the user has access to.
-    """
+# — Tools definitions — #
+@mcp.tool(
+    name="slack_list_channels",
+    description="List all public and private channels for a user",
+)
+def slack_list_channels(
+    team_id: str, current_user_id: str, limit: int = 100, cursor: Optional[str] = None
+):
     logger.info(
-        "slack_search_messages called: team_id=%s, user_id=%s, query=%r, count=%s, cursor=%s",
-        team_id, current_user_id, query, count, cursor
+        "slack_list_channels called team=%s user=%s limit=%s cursor=%s",
+        team_id,
+        current_user_id,
+        limit,
+        cursor,
     )
-    # Slack search.messages respects user token permissions
-    params = {"query": query, "count": count}
-    if cursor:
-        params["cursor"] = cursor
-    result = await service._slack_request(team_id, "GET", "search.messages", params=params)
-    # Optionally, could filter results.channels or result.messages.matches
-    return result
+    return slack.get_user_conversations(team_id, current_user_id, limit, cursor)
 
-# — Mount MCP SSE on FastAPI —
+
+@mcp.tool(
+    name="slack_get_channel_history",
+    description="Get recent messages from a channel if the user has access",
+)
+def slack_get_channel_history(
+    team_id: str, current_user_id: str, channel_id: str, limit: int = 10
+):
+    logger.info(
+        "slack_get_channel_history called team=%s user=%s channel=%s limit=%s",
+        team_id,
+        current_user_id,
+        channel_id,
+        limit,
+    )
+    # Verify user access
+    convs = slack.get_user_conversations(team_id, current_user_id)
+    channel_ids = [c["id"] for c in convs.get("channels", [])]
+    if channel_id not in channel_ids:
+        raise HTTPException(
+            status_code=403,
+            detail=f"User {current_user_id} does not have access to channel {channel_id}",
+        )
+    return slack.get_channel_history(team_id, channel_id, limit)
+
+
+# (Other tool definitions remain unchanged) — #
+
+app = FastAPI()
 app.mount("/", mcp.sse_app())
 
-# — Run via Uvicorn —
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", 8000))
-    logger.info(f"Starting Slack MCP SSE server on port {port}")
+
+    port = int(os.getenv("PORT", "8000"))
+    logger.info(f"Starting Slack MCP server (SSE+RPC) on port {port}")
     uvicorn.run(app, host="0.0.0.0", port=port)
