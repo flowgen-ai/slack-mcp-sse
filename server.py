@@ -17,10 +17,10 @@ if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL must be set in your .env")
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("slack_mcp")
+logger = logging.getLogger("slack_mcp_server")
 
 
-def fetch_bot_token(team_id: str) -> str:
+def fetch_token(team_id: str) -> str:
     """
     Retrieve the Slack bot token for a given team_id from Postgres.
     """
@@ -38,7 +38,7 @@ def fetch_bot_token(team_id: str) -> str:
 
 class SlackClient:
     def _get_headers(self, team_id: str) -> dict:
-        token = fetch_bot_token(team_id)
+        token = fetch_token(team_id)
         return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
     def get_user_conversations(self, team_id: str, current_user_id: str, limit: int = 100, cursor: Optional[str] = None) -> dict:
@@ -84,7 +84,7 @@ class SlackClient:
 
 
 # — Instantiate FastMCP and Slack client —
-mcp = FastMCP("SlackMCPServer", path_prefix="")
+mcp = FastMCP("slack_mcp-server", path_prefix="")
 slack = SlackClient()
 
 # — Tools definitions — #
